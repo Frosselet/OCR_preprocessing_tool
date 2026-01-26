@@ -23,7 +23,7 @@ from baml_client.inlinedbaml import get_baml_files
 
 # Default clients (can be overridden at runtime)
 DEFAULT_ANALYZE_CLIENT = "CustomGPT4oMini"
-DEFAULT_GENERATE_CLIENT = "CustomGPT4oMini"
+DEFAULT_GENERATE_CLIENT = "CustomGPT4o"
 
 
 def _extract_brace_block(text: str, start_pos: int) -> str:
