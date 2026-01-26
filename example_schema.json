@@ -1,0 +1,75 @@
+{
+  "className": "ShippingRecord",
+  "fields": {
+    "gc_fin_year": {
+      "type": "string",
+      "description": "GrainCorp financial year",
+      "required": false
+    },
+    "month": {
+      "type": "string",
+      "description": "Month of shipment",
+      "required": false
+    },
+    "port": {
+      "type": "string",
+      "description": "Port of loading",
+      "required": true
+    },
+    "reference_number": {
+      "type": "string",
+      "description": "Unique slot reference number, can be alphanumeric referring to the relevant commodity traded",
+      "required": false
+    },
+    "exporter": {
+      "type": "string",
+      "description": "Exporter company code",
+      "required": false
+    },
+    "vessel_name": {
+      "type": "string",
+      "description": "Name of ship, do not mix it with the reference number or epxorter code",
+      "required": false
+    },
+    "eta_date": {
+      "type": "string",
+      "description": "Expected arrival date",
+      "required": false
+    },
+    "loading_start": {
+      "type": "string",
+      "description": "Date loading commences",
+      "required": false
+    },
+    "etd_date": {
+      "type": "string",
+      "description": "Expected departure date",
+      "required": false
+    },
+    "nomination_received_date": {
+      "type": "string",
+      "description": "Date nomination was received",
+      "required": false
+    },
+    "nomination_accepted_date": {
+      "type": "string",
+      "description": "Date nomination was accepted",
+      "required": false
+    },
+    "status": {
+      "type": "string",
+      "description": "Current status of shipment",
+      "required": false
+    },
+    "commodity": {
+      "type": "string",
+      "description": "Type of commodity being shipped",
+      "required": false
+    },
+    "quantity_tonnes": {
+      "type": "float",
+      "description": "Quantity in tonnes",
+      "required": false
+    }
+  }
+}

@@ -1,5 +1,31 @@
-numpy==1.19.2
-opencv_python==4.5.4.60
-pdf2image==1.16.0
+# Core dependencies for PDF-to-Markdown conversion
+numpy>=1.19.2
+opencv-python>=4.5.4
+pdf2image>=1.16.0
 pillow>=9.2.0
-scipy==1.7.3
+pytesseract>=0.3.10
+
+# BAML dependencies for table normalization
+baml-py==0.218.0
+pydantic>=2.12.0
+typing-extensions>=4.15.0
+
+# Jupyter notebook for interactive demo (optional)
+jupyter>=1.0.0
+ipywidgets>=8.0.0
+
+# System Requirements:
+#
+# 1. Tesseract OCR (required):
+#    macOS:    brew install tesseract
+#    Ubuntu:   sudo apt-get install tesseract-ocr
+#    Windows:  https://github.com/UB-Mannheim/tesseract/wiki
+#
+# 2. Poppler (required for pdf2image):
+#    macOS:    brew install poppler
+#    Ubuntu:   sudo apt-get install poppler-utils
+#    Windows:  http://blog.alivate.com.au/poppler-windows/
+#
+# 3. Language packs (optional, for non-English OCR):
+#    macOS:    brew install tesseract-lang
+#    Ubuntu:   sudo apt-get install tesseract-ocr-jpn tesseract-ocr-chi-sim
