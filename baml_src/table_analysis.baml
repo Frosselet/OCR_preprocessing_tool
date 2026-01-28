@@ -68,6 +68,7 @@ function AnalyzeTableStructure(markdownTable: string, pageContext: string?) -> T
   "#
 }
 
+// Generate normalized table from markdown - standard version
 function GenerateNormalizedTable(
   markdownTable: string,
   metadata: TableMetadata,
@@ -75,39 +76,186 @@ function GenerateNormalizedTable(
 ) -> string {
   client CustomGPT4o
   prompt #"
-    Convert this markdown table to 1NF (First Normal Form) based on the provided metadata and user schema.
+    Convert this markdown table to 1NF (First Normal Form).
 
     Table Metadata:
     - Type: {{ metadata.tableType }}
-    - Orientation: {{ metadata.dataOrientation }}
     - Headers at rows: {{ metadata.headerRowIndices }}
     - Totals at rows: {{ metadata.totalRowIndices }}
     - Has subtotals: {{ metadata.hasSubtotals }}
-    - Notes: {{ metadata.notes }}
 
-    Target Schema:
-    Class: {{ userSchema.className }}
+    Target Schema ({{ userSchema.className }}):
     {% for field in userSchema.fields %}
-    - {{ field.name }}: {{ field.type }}{% if field.description %} ({{ field.description }}){% endif %}{% if field.required %} [REQUIRED]{% endif %}
+    - {{ field.name }}: {{ field.type }} — {{ field.description }}
     {% endfor %}
 
-    Instructions:
-    1. CRITICAL: Extract EVERY meaningful data row as a separate record - do NOT stop early or truncate
-    2. Skip header rows (indices: {{ metadata.headerRowIndices }}), total rows (indices: {{ metadata.totalRowIndices }}), and empty rows
-    3. Map data to the specified schema fields by position and semantic matching
-    4. For hierarchical tables, carry forward group values to detail rows (fill empty cells with values from above)
-    5. Convert data types as needed (dates, numbers, booleans)
-    6. Parse numeric values with commas (e.g., "30,000" -> 30000)
-    7. Handle missing data with null or appropriate defaults
-    8. Return ONLY a valid JSON array of objects matching the schema
-    9. IMPORTANT: Process the ENTIRE table from start to finish - do not stop until you have extracted ALL data rows
+    OCR MERGED CELL RECOVERY:
+    Resolve merged cells by splitting content and assigning to correct fields:
+    - Identify cells with multiple values by comparing column count to header
+    - Split by type boundaries and match each part to field descriptions
+    - Assign split values to adjacent empty fields that match the type
 
-    Output format: JSON array of objects with keys matching field names
+    VALIDATION:
+    Use "note" only for truly unresolvable anomalies:
+    - Resolve what can be resolved based on type matching
+    - Field descriptions define the contract
+    - Only null + note when data cannot be recovered
 
-    REMINDER: You MUST extract ALL rows. If there are 50 data rows, output 50 records. If there are 100 data rows, output 100 records.
+    EXTRACTION:
+    1. Extract EVERY data row - no truncation
+    2. Skip headers, totals, empty rows
+    3. Carry forward group values for hierarchical tables
+    4. Parse numbers: remove commas
+    5. Return ONLY valid JSON array
 
     {{ _.role("user") }}
-    Markdown Table:
     {{ markdownTable }}
+  "#
+}
+
+// Fast generation for dense uniform tables - uses TOON format for efficiency
+// TOON = pipe-delimited compact format, ~30-50% fewer tokens
+function GenerateNormalizedTableFast(
+  toonTable: string,
+  userSchema: UserSchema,
+  groupContext: string?
+) -> string {
+  client CustomGPT4o
+  prompt #"
+    Convert this TOON-format table data to JSON array.
+    TOON format: pipe-delimited rows, first row is headers.
+
+    Schema ({{ userSchema.className }}):
+    {% for field in userSchema.fields %}
+    {{ field.name }}: {{ field.type }} — {{ field.description }}
+    {% endfor %}
+
+    {% if groupContext %}
+    Context (apply to all rows): {{ groupContext }}
+    {% endif %}
+
+    MERGED CELL RECOVERY:
+    Resolve merged cells by splitting content and assigning to correct fields:
+    - Identify cells with multiple values by comparing column count to header
+    - Split by type boundaries and match each part to field descriptions
+    - Assign split values to adjacent empty fields that match the type
+
+    VALIDATION:
+    Use "note" only for truly unresolvable anomalies:
+    - Resolve what can be resolved based on type matching
+    - Field descriptions define the contract
+    - Only null + note when data cannot be recovered
+
+    EXTRACTION:
+    - Extract ALL rows, no truncation
+    - Skip totals/subtotals
+    - Parse numbers: remove commas
+    - Output: JSON array only
+
+    {{ _.role("user") }}
+    {{ toonTable }}
+  "#
+}
+
+// Process a chunk of table rows (for parallel chunking)
+function GenerateNormalizedTableChunk(
+  toonChunk: string,
+  userSchema: UserSchema,
+  chunkIndex: int,
+  groupContext: string?
+) -> string {
+  client CustomGPT4o
+  prompt #"
+    Convert this table chunk (chunk {{ chunkIndex }}) to JSON array.
+    Format: pipe-delimited, first row is headers.
+
+    Schema ({{ userSchema.className }}):
+    {% for field in userSchema.fields %}
+    {{ field.name }}: {{ field.type }} — {{ field.description }}
+    {% endfor %}
+
+    {% if groupContext %}
+    Apply to all rows: {{ groupContext }}
+    {% endif %}
+
+    MERGED CELL RECOVERY:
+    Resolve merged cells by splitting content and assigning to correct fields:
+    - Identify cells with multiple values by comparing column count to header
+    - Split by type boundaries and match each part to field descriptions
+    - Assign split values to adjacent empty fields that match the type
+
+    VALIDATION:
+    Use "note" only for truly unresolvable anomalies:
+    - Resolve what can be resolved based on type matching
+    - Field descriptions define the contract
+    - Only null + note when data cannot be recovered
+
+    EXTRACTION:
+    - Extract ALL rows in this chunk
+    - Skip totals
+    - Parse numbers: remove commas
+    - Output: JSON array only
+
+    {{ _.role("user") }}
+    {{ toonChunk }}
+  "#
+}
+
+// Review and complete extraction - ensures no rows are missing
+function ReviewAndCompleteExtraction(
+  markdownTable: string,
+  extractedJson: string,
+  metadata: TableMetadata,
+  userSchema: UserSchema
+) -> string {
+  client CustomGPT4o
+  prompt #"
+    Review extracted JSON against source markdown. Output COMPLETE, CORRECTED JSON array.
+
+    Table Metadata:
+    - Type: {{ metadata.tableType }}
+    - Estimated data rows: {{ metadata.estimatedRows }}
+    - Header rows (skip): {{ metadata.headerRowIndices }}
+    - Total/subtotal rows (skip): {{ metadata.totalRowIndices }}
+
+    Target Schema ({{ userSchema.className }}):
+    {% for field in userSchema.fields %}
+    - {{ field.name }}: {{ field.type }} — {{ field.description }}
+    {% endfor %}
+
+    REVIEW TASK:
+    1. Compare source markdown ROW BY ROW against extracted JSON
+    2. For each data row: if MISSING, extract and add; if PRESENT, verify correctness
+    3. Output COMPLETE JSON array with ALL data rows
+
+    MERGED CELL RECOVERY:
+    Resolve merged cells by splitting content and assigning to correct fields:
+    - Identify cells with multiple values by comparing column count to header
+    - Split by type boundaries and match each part to field descriptions
+    - Assign split values to adjacent empty fields that match the type
+
+    VALIDATION:
+    Use "note" only for truly unresolvable anomalies:
+    - Resolve what can be resolved based on type matching
+    - Field descriptions define the contract
+    - Only null + note when data cannot be recovered
+
+    RULES:
+    - Output valid JSON array only
+    - Every data row must appear
+    - Carry forward group values for hierarchical tables
+    - Parse numbers: remove commas
+    - Add missing rows - do not just report them
+
+    Output: JSON array only, no explanations, no markdown.
+
+    {{ _.role("user") }}
+    === SOURCE MARKDOWN ===
+    {{ markdownTable }}
+
+    === EXTRACTED JSON ===
+    {{ extractedJson }}
+
+    === CORRECTED OUTPUT ===
   "#
 }

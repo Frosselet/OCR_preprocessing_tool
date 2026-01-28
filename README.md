@@ -1,260 +1,200 @@
-# PDF to Markdown Converter
+# PDF Table Extraction Pipeline
 
-Simple, focused tool for converting digital PDFs (and XLS/HTML exports) to markdown with intelligent table extraction.
+LLM-augmented table extraction for documents where traditional parsers fall short.
 
-**Optimized for digital documents** - no preprocessing needed. Works perfectly with colored table backgrounds, formatted cells, and multi-column layouts.
+## Why This Project?
 
-## 🚀 Interactive Demo
+Tools like [Docling](https://github.com/DS4SD/docling), [Marker](https://github.com/VikParuchuri/marker), and [Camelot](https://github.com/camelot-dev/camelot) work well for standard tables. But they rely on heuristics that assume conventional layouts.
 
-**New users: Start here!** Launch the interactive Jupyter notebook:
+**This project fills the gap when heuristics underestimate human creativity:**
+
+- Tables with merged cells that span columns inconsistently
+- Hierarchical data with subtotals embedded throughout
+- Pivot-style layouts mixed with flat data
+- OCR artifacts from unusual font/spacing combinations
+- Multi-page tables with varying column widths
+
+The key insight: **LLMs can reason about table structure** in ways heuristics cannot. By using AI to *heal* OCR artifacts and *extract* to user-defined schemas, we handle edge cases that break traditional parsers.
+
+## Architecture
+
+The pipeline has three distinct stages with clear separation of concerns:
+
+```
+PDF → OCR → Raw Markdown → HEAL → Clean Markdown → EXTRACT → JSON
+        ↓                    ↓                        ↓
+   (Tesseract)        (Inferred Schema)        (User Schema)
+                    Document-driven           Human intent
+```
+
+### Stage 1: OCR (pdf_to_markdown.py)
+Converts PDF pages to markdown using Tesseract with spatial table extraction. Works best with digital documents (PDF exports, not scans).
+
+### Stage 2: Heal (table_healer.py)
+Fixes OCR artifacts using an **inferred schema** - what the document *actually shows*:
+1. **InferTableSchema** - Detect column count, merged cells, data types
+2. **HealToStructuredData** - Split merged cells using type boundaries
+3. **FormatAsCleanMarkdown** - Output clean, normalized markdown
+
+This stage is *document-driven*. It doesn't know what you want - it fixes what OCR broke.
+
+### Stage 3: Extract (table_normalizer_async.py)
+Converts clean markdown to structured JSON using a **user schema** - what you *actually want*:
+1. **Analyze** - Detect table structure (hierarchical, pivot, flat)
+2. **Generate** - Extract records matching your schema
+3. **Review** - Validate completeness, fill gaps
+
+This stage is *intent-driven*. Your schema defines the output structure.
+
+### Why Separate Healing from Extraction?
+
+**Healing** uses an inferred schema because OCR artifacts are document-specific. A merged cell like "57690 ARRC." needs to be split into `57690` | `ARRC.` regardless of what the user wants to extract.
+
+**Extraction** uses a user schema because the output should match human intent, not OCR quirks. The schema is defined *before* seeing the document.
+
+This separation keeps each stage focused and prevents OCR artifacts from polluting the user's schema definition.
+
+## Quick Start
 
 ```bash
-# First-time setup
-python setup_jupyter_kernel.py  # Installs Jupyter kernel for our environment
+# Install dependencies
+brew install tesseract poppler  # macOS
+uv sync                          # Python packages
 
-# Set OpenAI API key (required for BAML normalization)
+# Set API key
 export OPENAI_API_KEY=your_key_here
 
-# Launch notebook
+# Run interactive demo
+python setup_jupyter_kernel.py   # First time only
 uv run jupyter notebook pipeline_demo.ipynb
 ```
 
-The notebook will validate your setup, show available PDFs, and guide you through the complete pipeline with live previews.
+## Pipeline Demo Notebook
 
-**Why the kernel setup?** Jupyter needs a kernel that uses our uv virtual environment. The setup script (run once) registers this kernel so the notebook can access all installed packages.
+The Jupyter notebook (`pipeline_demo.ipynb`) provides an interactive walkthrough:
 
-## Features
+1. **Setup Validation** - Check dependencies and API keys
+2. **PDF Selection** - Browse and preview available PDFs
+3. **OCR Conversion** - PDF → Markdown with spatial extraction
+4. **Healing (Optional)** - Fix merged cells and OCR artifacts
+5. **Schema Definition** - Define your target structure
+6. **Extraction** - Convert to normalized JSON
+7. **Review** - Inspect and export results
 
-- ✅ **Spatial table extraction** - Accurately detects columns and rows using text position analysis
-- ✅ **No preprocessing** - Direct OCR on clean digital documents for best quality
-- ✅ **GitHub Flavored Markdown** - Tables output in standard markdown format
-- ✅ **Multi-language support** - Works with any language Tesseract supports
-- ✅ **Multi-page PDFs** - Processes all pages automatically
-- ✅ **AI-powered normalization** - Convert hierarchical/pivot tables to 1NF with BAML (see [BAML_README.md](BAML_README.md))
+## CLI Usage
+
+### PDF to Markdown
+```bash
+uv run python pdf_to_markdown.py input.pdf output.md --dpi 300
+```
+
+### Heal OCR Artifacts
+```bash
+uv run python table_healer.py input.md -o healed.md
+```
+
+### Extract to JSON
+```bash
+uv run python table_normalizer_async.py healed.md output.json --schema my_schema.json
+```
+
+### Full Pipeline (Example)
+```bash
+uv run python example_pipeline_async.py
+```
+
+## Defining Your Schema
+
+Create a JSON file describing the records you want to extract:
+
+```json
+{
+  "className": "InvoiceItem",
+  "fields": {
+    "item_code": {"type": "string", "description": "Product SKU", "required": true},
+    "description": {"type": "string", "description": "Item description"},
+    "quantity": {"type": "int", "description": "Units ordered"},
+    "unit_price": {"type": "float", "description": "Price per unit"},
+    "total": {"type": "float", "description": "Line total"}
+  }
+}
+```
+
+The schema is purely about *your intent* - what data you need. Keep descriptions focused on the business meaning, not OCR edge cases.
+
+## When to Use This Tool
+
+**Good fit:**
+- Complex tables that break Camelot/Docling
+- Documents with merged cells or irregular layouts
+- Multi-page tables with subtotals and grouping
+- When you need custom output schemas
+
+**Better alternatives exist for:**
+- Simple, well-formatted tables (use Camelot)
+- Scanned documents needing heavy preprocessing
+- Tables embedded in dense text (use Docling)
+- High-volume batch processing where speed matters more than accuracy
+
+## Project Structure
+
+```
+Core Pipeline:
+├── pdf_to_markdown.py       # Stage 1: OCR
+├── table_healer.py          # Stage 2: Healing
+├── table_normalizer_async.py # Stage 3: Extraction
+└── example_pipeline_async.py # End-to-end example
+
+BAML Definitions:
+├── baml_src/
+│   ├── table_healing.baml   # Healing prompts
+│   ├── table_analysis.baml  # Extraction prompts
+│   └── clients.baml         # Model configuration
+
+Configuration:
+├── example_schema.json      # Sample user schema
+├── pyproject.toml           # Dependencies (uv)
+└── requirements.txt         # Dependencies (pip)
+
+Documentation:
+├── README.md                # This file
+├── BAML_README.md           # BAML details
+├── ASYNC_PROCESSING.md      # Async guide
+└── NOTEBOOK_GUIDE.md        # Jupyter usage
+```
+
+## Technical Details
+
+### TOON Format
+The healing stage uses Token-Optimized Object Notation internally, reducing LLM token usage by 30-50% for structured data.
+
+### Async Parallel Processing
+Multi-page documents are processed in parallel - analysis starts immediately for all pages, and generation follows as soon as each page's analysis completes.
+
+### Model Selection
+Default configuration uses GPT-4o-mini for fast stages (analysis, formatting) and GPT-4o for accuracy-critical stages (healing, generation). Configure in BAML or via CLI flags.
 
 ## Installation
 
-### Quick Start with uv (Recommended)
+### Prerequisites
+- Python 3.11+
+- Tesseract OCR
+- Poppler (for PDF rendering)
+- OpenAI API key (or Anthropic for Claude)
 
-[uv](https://github.com/astral-sh/uv) is a fast Python package manager. It's much faster than pip and handles dependencies better.
-
+### macOS
 ```bash
-# Install uv (if not already installed)
+brew install tesseract poppler
 curl -LsSf https://astral.sh/uv/install.sh | sh
-
-# Clone the repo
-git clone <repo-url>
-cd OCR_preprocessing_tool
-
-# Install system dependencies (Tesseract + Poppler)
-# macOS:
-brew install tesseract poppler
-
-# Ubuntu/Debian:
-# sudo apt-get install tesseract-ocr poppler-utils
-
-# Install Python dependencies with uv
 uv sync
-
-# Run the script
-uv run python pdf_to_markdown.py test_images/graincorp.pdf output/result.md
 ```
 
-### Alternative: Traditional pip Installation
-
-<details>
-<summary>Click to expand pip installation instructions</summary>
-
-#### 1. Install Python dependencies
-
-```bash
-pip install -r requirements.txt
-```
-
-#### 2. Install system dependencies
-
-**macOS:**
-```bash
-brew install tesseract poppler
-```
-
-**Ubuntu/Debian:**
+### Ubuntu/Debian
 ```bash
 sudo apt-get install tesseract-ocr poppler-utils
+curl -LsSf https://astral.sh/uv/install.sh | sh
+uv sync
 ```
-
-**Windows:**
-- Tesseract: https://github.com/UB-Mannheim/tesseract/wiki
-- Poppler: http://blog.alivate.com.au/poppler-windows/
-
-</details>
-
-### (Optional) Install language packs
-
-For non-English OCR:
-
-**macOS:**
-```bash
-brew install tesseract-lang
-```
-
-**Ubuntu:**
-```bash
-sudo apt-get install tesseract-ocr-jpn tesseract-ocr-chi-sim
-```
-
-## Usage
-
-### With uv (Recommended)
-
-```bash
-# Basic usage
-uv run python pdf_to_markdown.py input.pdf output.md
-
-# Or use the installed script directly
-uv run pdf-to-md input.pdf output.md
-
-# Specify DPI (higher = better quality, slower)
-uv run python pdf_to_markdown.py --pdf document.pdf --output result.md --dpi 600
-
-# Non-English documents
-uv run python pdf_to_markdown.py --pdf japanese.pdf --output result.md --lang jpn
-
-# Quiet mode
-uv run python pdf_to_markdown.py document.pdf output.md --quiet
-```
-
-### Without uv (traditional)
-
-```bash
-# Basic usage
-python pdf_to_markdown.py input.pdf output.md
-
-# With options
-python pdf_to_markdown.py --pdf document.pdf --output result.md --dpi 600
-python pdf_to_markdown.py --pdf japanese.pdf --output result.md --lang jpn
-python pdf_to_markdown.py document.pdf output.md --quiet
-```
-
-## Example
-
-**Input:** `graincorp.pdf` (3-page shipping manifest with complex tables)
-
-**Command:**
-```bash
-python pdf_to_markdown.py test_images/graincorp.pdf output/graincorp.md
-```
-
-**Output:** Clean markdown with properly formatted tables:
-
-```markdown
-# Page 1
-
-| GC Fin Year | Month | Port | Reference Number | Exporter | Name Of Ship | Date ETA of Ship | ... |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| 2025/26 | Nov 25 | Mackay | 56285 | GCOP | DODO | 18/11/2025 | ... |
-| 2025/26 | Nov 25 | Gladstone | 56307 | GCOP | DELTA | 22/11/2025 | ... |
-```
-
-## How It Works
-
-1. **PDF Rendering** - Converts PDF pages to high-resolution images (300 DPI default)
-2. **Text Detection** - Uses Tesseract to detect all text with bounding boxes
-3. **Spatial Clustering** - Groups text into rows and detects column boundaries
-4. **Word Merging** - Combines nearby words into single cells
-5. **Markdown Generation** - Outputs clean GitHub Flavored Markdown tables
-
-**No preprocessing is applied** because digital documents (PDF, XLS exports, HTML) are already high quality. Preprocessing (denoising, enhancement) actually degrades quality on clean documents.
-
-## Supported Document Types
-
-This tool is optimized for **digitally-generated documents**:
-
-- ✅ PDF reports with tables
-- ✅ Excel exports saved as PDF
-- ✅ HTML tables printed to PDF
-- ✅ Invoices, shipping manifests, data tables
-- ✅ Documents with colored table backgrounds
-
-**Not recommended for:**
-- ❌ Scanned documents (use adaptive preprocessing instead)
-- ❌ Photos of documents (use perspective correction first)
-- ❌ Handwritten notes
-
-## Table Normalization (BAML)
-
-For advanced use cases, you can convert OCR'd tables to 1NF (First Normal Form) using BAML:
-
-```bash
-# Async parallel processing (recommended for multi-page PDFs)
-uv run python example_pipeline_async.py
-
-# Or synchronous version
-uv run python example_pipeline.py
-```
-
-**⚡ Async version is ~3x faster for multi-page documents!**
-
-This intelligently handles:
-- **Hierarchical tables** (with subtotals and grouping)
-- **Pivot tables** (transposed data)
-- **Irregular structures** (merged cells, variable columns)
-
-**Features:**
-- Page-by-page processing (better accuracy)
-- Parallel execution (much faster)
-- Tiered models: gpt-4o-mini for classification, gpt-4o for 1NF conversion
-
-Define your own schema and extract structured data! See [BAML_README.md](BAML_README.md) and [ASYNC_PROCESSING.md](ASYNC_PROCESSING.md) for details.
-
-## Files
-
-**Core Pipeline:**
-- `pdf_to_markdown.py` - Main PDF to markdown conversion
-- `improved_table_extractor.py` - Spatial table extraction engine
-- `table_normalizer.py` - BAML normalization (synchronous)
-- `table_normalizer_async.py` - BAML normalization (async parallel) ⚡
-- `example_pipeline.py` - Complete PDF-to-1NF example (sync)
-- `example_pipeline_async.py` - Complete PDF-to-1NF example (async) ⚡
-
-**Documentation:**
-- `README.md` - This file
-- `QUICKSTART.md` - Quick setup guide
-- `BAML_README.md` - BAML normalization details
-- `ASYNC_PROCESSING.md` - Async parallel processing guide ⚡
-- `NOTEBOOK_GUIDE.md` - Jupyter notebook usage
-
-**Configuration:**
-- `requirements.txt` - Python dependencies
-- `pyproject.toml` - uv configuration
-- `baml_src/` - BAML schema and client configuration
-
-**Examples:**
-- `test_images/graincorp.pdf` - Example PDF
-- `example_schema.json` - Sample schema for shipping manifest
-
-## Performance
-
-- **Speed:** ~5-10 seconds per page at 300 DPI
-- **Accuracy:** 95%+ for printed text in digital documents
-- **Table detection:** Works with 15+ column tables
-
-## Troubleshooting
-
-**"pytesseract not installed"**
-- Run: `pip install pytesseract`
-- Install Tesseract binary (see installation section)
-
-**"pdf2image error"**
-- Install Poppler (see installation section)
-
-**Tables not detected correctly**
-- Try higher DPI: `--dpi 600`
-- For very complex tables, results may vary
-
-**Wrong language detected**
-- Specify language: `--lang jpn` (or `fra`, `deu`, `chi_sim`, etc.)
-- Install language pack if needed
 
 ## License
 
@@ -262,5 +202,6 @@ See LICENSE file.
 
 ## Credits
 
-- Built on [Tesseract OCR](https://github.com/tesseract-ocr/tesseract)
-- Uses [pdf2image](https://github.com/Belval/pdf2image) for PDF rendering
+- [Tesseract OCR](https://github.com/tesseract-ocr/tesseract) - Text extraction
+- [BAML](https://github.com/BoundaryML/baml) - LLM function definitions
+- [pdf2image](https://github.com/Belval/pdf2image) - PDF rendering
