@@ -28,7 +28,9 @@ PDF → Images → OCR → Raw Markdown → HEAL → Clean Markdown → EXTRACT 
 ```
 
 ### Stage 1: OCR (pdf_to_markdown.py)
-Renders PDF pages as images (via Poppler), then runs Tesseract OCR with spatial table extraction to produce markdown. Works best with digital documents (PDF exports, not scans).
+Renders PDF pages as images (via Poppler), then runs Tesseract OCR with spatial table extraction to produce markdown.
+
+**Source quality matters:** Vector-based PDFs (Excel/Word exports, digital reports) render as crisp images and produce excellent OCR results. Scanned documents are already rasterized and may contain noise, skew, or compression artifacts - consider preprocessing for best results.
 
 ### Stage 2: Heal (table_healer.py)
 Fixes OCR artifacts using an **inferred schema** - what the document *actually shows*:
