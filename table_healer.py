@@ -154,15 +154,20 @@ async def heal_markdown(
 async def heal_multiple_pages(
     pages: List[str],
     infer_client: str = "CustomGPT4oMini",
-    heal_client: str = "CustomGPT4o"
+    heal_client: str = "CustomGPT4o",
+    format_client: str = "CustomGPT4oMini"
 ) -> List[HealingResult]:
     """
-    Heal multiple markdown pages in parallel.
+    Heal multiple markdown pages with optimized parallel processing.
+
+    Runs all inference steps in parallel first, then all healing steps
+    in parallel, then all formatting steps in parallel.
 
     Args:
         pages: List of raw OCR markdown strings
         infer_client: Fast model for inference
         heal_client: Capable model for healing
+        format_client: Fast model for formatting
 
     Returns:
         List of HealingResult, one per page
@@ -171,28 +176,133 @@ async def heal_multiple_pages(
     print(f"   Pages: {len(pages)}")
     print(f"   Infer: {infer_client}")
     print(f"   Heal: {heal_client}")
+    print(f"   Format: {format_client}")
     print()
 
-    tasks = [
-        heal_markdown(page, i, infer_client, heal_client)
-        for i, page in enumerate(pages, 1)
-    ]
+    total_start = time.time()
+    n_pages = len(pages)
 
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+    # =========================================================================
+    # PHASE 1: INFER ALL SCHEMAS IN PARALLEL
+    # =========================================================================
+    print(f"[Phase 1] Inferring table structure for {n_pages} pages...")
+    infer_start = time.time()
 
-    # Handle errors
-    final_results = []
-    for i, result in enumerate(results, 1):
+    async def infer_one(page_num: int, content: str):
+        schema = await b.with_options(client=infer_client).InferTableSchema(content)
+        return page_num, schema
+
+    infer_tasks = [infer_one(i, page) for i, page in enumerate(pages, 1)]
+    infer_results = await asyncio.gather(*infer_tasks, return_exceptions=True)
+
+    # Collect successful inferences
+    schemas = {}  # page_num -> schema
+    for result in infer_results:
         if isinstance(result, Exception):
-            print(f"❌ Page {i} failed: {result}")
+            print(f"  ❌ Inference failed: {result}")
         else:
-            final_results.append(result)
+            page_num, schema = result
+            schemas[page_num] = schema
+            status = "needs healing" if schema.hasMergedCells else "clean"
+            print(f"  Page {page_num}: {schema.expectedColumns} cols × {schema.expectedDataRows} rows ({status})")
+
+    infer_time = time.time() - infer_start
+    print(f"  ⏱️  Inference: {infer_time:.1f}s")
+
+    # =========================================================================
+    # PHASE 2: HEAL PAGES WITH MERGED CELLS IN PARALLEL
+    # =========================================================================
+    pages_to_heal = [(i, pages[i-1], schemas[i]) for i in schemas if schemas[i].hasMergedCells]
+
+    clean_data = {}  # page_num -> CleanTableData
+    heal_time = 0.0
+
+    if pages_to_heal:
+        print(f"\n[Phase 2] Healing {len(pages_to_heal)} pages with merged cells...")
+        heal_start = time.time()
+
+        async def heal_one(page_num: int, content: str, schema):
+            data = await b.with_options(client=heal_client).HealToStructuredData(content, schema)
+            return page_num, data
+
+        heal_tasks = [heal_one(pn, content, schema) for pn, content, schema in pages_to_heal]
+        heal_results = await asyncio.gather(*heal_tasks, return_exceptions=True)
+
+        for result in heal_results:
+            if isinstance(result, Exception):
+                print(f"  ❌ Healing failed: {result}")
+            else:
+                page_num, data = result
+                clean_data[page_num] = data
+                print(f"  Page {page_num}: {data.rowCount} rows × {data.columnCount} cols")
+                if data.healingNotes:
+                    for note in data.healingNotes[:2]:
+                        print(f"    → {note}")
+
+        heal_time = time.time() - heal_start
+        print(f"  ⏱️  Healing: {heal_time:.1f}s")
+    else:
+        print(f"\n[Phase 2] No pages need healing - all clean!")
+
+    # =========================================================================
+    # PHASE 3: FORMAT HEALED PAGES AS MARKDOWN IN PARALLEL
+    # =========================================================================
+    healed_markdown = {}  # page_num -> markdown string
+    format_time = 0.0
+
+    if clean_data:
+        print(f"\n[Phase 3] Formatting {len(clean_data)} healed pages...")
+        format_start = time.time()
+
+        async def format_one(page_num: int, data):
+            md = await b.with_options(client=format_client).FormatAsCleanMarkdown(data)
+            return page_num, md
+
+        format_tasks = [format_one(pn, data) for pn, data in clean_data.items()]
+        format_results = await asyncio.gather(*format_tasks, return_exceptions=True)
+
+        for result in format_results:
+            if isinstance(result, Exception):
+                print(f"  ❌ Formatting failed: {result}")
+            else:
+                page_num, md = result
+                healed_markdown[page_num] = md
+                print(f"  Page {page_num}: {len(md):,} chars")
+
+        format_time = time.time() - format_start
+        print(f"  ⏱️  Formatting: {format_time:.1f}s")
+
+    # =========================================================================
+    # BUILD RESULTS
+    # =========================================================================
+    total_time = time.time() - total_start
+    results = []
+
+    for i, page in enumerate(pages, 1):
+        if i not in schemas:
+            continue  # Inference failed for this page
+
+        schema = schemas[i]
+        final_markdown = healed_markdown.get(i, page)  # Use healed or original
+        data = clean_data.get(i, None)
+
+        results.append(HealingResult(
+            page_number=i,
+            original_markdown=page,
+            healed_markdown=final_markdown,
+            inferred_schema=schema,
+            clean_data=data,
+            infer_time=infer_time / n_pages,  # Approximate per-page
+            heal_time=heal_time / max(len(pages_to_heal), 1),
+            format_time=format_time / max(len(clean_data), 1),
+            total_time=total_time / n_pages
+        ))
 
     # Summary
-    healed_count = sum(1 for r in final_results if r.had_merged_cells)
-    print(f"\n✅ Healed {healed_count}/{len(final_results)} pages with merged cells")
+    healed_count = sum(1 for r in results if r.had_merged_cells)
+    print(f"\n✅ Healed {healed_count}/{len(results)} pages | Total: {total_time:.1f}s")
 
-    return final_results
+    return results
 
 
 def save_healed_markdown(result: HealingResult, output_path: str):
