@@ -21,14 +21,14 @@ The key insight: **LLMs can reason about table structure** in ways heuristics ca
 The pipeline has three distinct stages with clear separation of concerns:
 
 ```
-PDF → OCR → Raw Markdown → HEAL → Clean Markdown → EXTRACT → JSON
-        ↓                    ↓                        ↓
-   (Tesseract)        (Inferred Schema)        (User Schema)
-                    Document-driven           Human intent
+PDF → Images → OCR → Raw Markdown → HEAL → Clean Markdown → EXTRACT → JSON
+       ↓        ↓                    ↓                        ↓
+   (Poppler) (Tesseract)      (Inferred Schema)        (User Schema)
+                              Document-driven           Human intent
 ```
 
 ### Stage 1: OCR (pdf_to_markdown.py)
-Converts PDF pages to markdown using Tesseract with spatial table extraction. Works best with digital documents (PDF exports, not scans).
+Renders PDF pages as images (via Poppler), then runs Tesseract OCR with spatial table extraction to produce markdown. Works best with digital documents (PDF exports, not scans).
 
 ### Stage 2: Heal (table_healer.py)
 Fixes OCR artifacts using an **inferred schema** - what the document *actually shows*:
