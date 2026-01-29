@@ -193,103 +193,84 @@ function GenerateNormalizedTable(
 // LINE-BY-LINE TABLE PROCESSING
 // =============================================================================
 
-enum RowType {
-  HEADER @description("Column header row")
-  DATA @description("Regular data row")
-  TOTAL @description("Total or subtotal row")
-  GROUP_HEADER @description("Group/category label row spanning columns")
-  SEPARATOR @description("Separator row (dashes, equals, etc.)")
-  TITLE @description("Table title or caption row")
-  EMPTY @description("Empty or whitespace-only row")
-}
-
 class ParsedTableRow {
-  rowIndex int @description("0-based row index from the original table")
-  rowType RowType @description("Classification of this row")
-  cells string[] @description("Parsed cell values, one per expected column. Split merged cells to match expectedColumns count.")
-  confidence float @description("Confidence score 0.0-1.0 for this parse")
-  groupLabel string? @description("If rowType is GROUP_HEADER, the group/category label")
-  totalLabel string? @description("If rowType is TOTAL, the total label (e.g. 'Subtotal', 'Grand Total')")
-  notes string? @description("Any observations about merged cells, splitting decisions, or data quality")
+  rowData string[] @description("Array of cell values extracted from this line")
+  isHeaderRow bool @description("Whether this appears to be a header row")
+  isDataRow bool @description("Whether this contains actual data")
+  isTotalRow bool @description("Whether this is a total/summary row")
+  isEmpty bool @description("Whether this row is empty or meaningless")
+  confidence float @description("Confidence in the parsing (0-1)")
 }
 
+// Small, focused function for single line processing
 function ParseSingleTableLine(
   markdownLine: string,
-  rowIndex: int,
   expectedColumns: int,
-  columnNames: string[],
-  fieldTypes: string[]
+  fieldTypes: string[],
+  userSchema: UserSchema,
+  previousLines: string[]
 ) -> ParsedTableRow {
-  client CustomGPT5Mini
+  client CustomGPT4oMini
   prompt #"
-    Parse this single markdown table line into structured cells.
+    Parse this single markdown table line into structured data.
 
-    Row index: {{ rowIndex }}
-    Expected columns: {{ expectedColumns }}
-    Column names: {{ columnNames }}
-    Field types: {{ fieldTypes }}
-
-    INSTRUCTIONS:
-    1. CLASSIFY the row type (HEADER, DATA, TOTAL, GROUP_HEADER, SEPARATOR, TITLE, EMPTY)
-    2. SPLIT the line into exactly {{ expectedColumns }} cells
-    3. If the line has FEWER pipe-separated values than expected, cells are likely merged:
-       - Use field types and column names to determine where to split
-       - Example: "John Doe 2023-01-15 Manager" with types [string, string, string] and names [name, date, title]
-         → split into ["John Doe", "2023-01-15", "Manager"]
-    4. If the line has MORE pipe-separated values than expected, merge adjacent cells
-    5. Clean cell values: trim whitespace, remove stray pipes
-    6. For TOTAL rows: identify the total label (e.g., "Total", "Subtotal")
-    7. For GROUP_HEADER rows: extract the group label
-    8. Set confidence based on how certain you are about the parse (1.0 = perfect pipe-delimited row, 0.5 = had to split/merge)
-
-    {{ ctx.output_format }}
-
-    {{ _.role("user") }}
-    Markdown line:
-    {{ markdownLine }}
-  "#
-}
-
-function CombineParsedRows(
-  parsedRows: ParsedTableRow[],
-  columnNames: string[],
-  userSchema: UserSchema
-) -> string {
-  client CustomGPT5Mini
-  prompt #"
-    Combine these individually-parsed table rows into a final JSON array.
-
-    Column names: {{ columnNames }}
-
-    Target Schema:
+    TARGET SCHEMA (use this to understand what a data row looks like):
     Class: {{ userSchema.className }}
     Fields:
     {{ userSchema.fields|format(type="toon", delimiter="pipe") }}
 
-    Parsed rows (TOON format):
-    {{ parsedRows|format(type="toon", delimiter="pipe") }}
+    Expected columns: {{ expectedColumns }}
+    Expected field types: {{ fieldTypes|format(type="toon") }}
 
-    INSTRUCTIONS:
-    1. FILTER: Keep only rows where rowType is DATA. Skip HEADER, SEPARATOR, TITLE, EMPTY rows.
-    2. TOTAL ROWS: Skip TOTAL rows (they are summary rows, not data).
-    3. HIERARCHICAL CARRY-FORWARD: For GROUP_HEADER rows, carry the groupLabel forward
-       to all subsequent DATA rows until the next GROUP_HEADER. Map the group label to the
-       appropriate schema field.
-    4. MAP cells to schema fields by position (cells[0] → first field, cells[1] → second field, etc.)
-    5. TYPE CONVERSION:
-       - "int" fields: parse integers, remove commas (e.g., "1,234" → 1234)
-       - "float" fields: parse floats, remove commas (e.g., "1,234.56" → 1234.56)
-       - "bool" fields: parse booleans
-       - "string" fields: keep as-is, trim whitespace
-       - Empty/blank cells → null
-    6. Return ONLY a valid JSON array of objects matching the schema field names.
+    CONTEXT — preceding lines (most recent last):
+    {% for line in previousLines %}
+    {{ line }}
+    {% endfor %}
 
-    QUALITY CHECKS:
-    - Every record must have all schema fields (use null for missing)
-    - No duplicate records
-    - Verify type conversions are correct
+    ROW CLASSIFICATION:
+    - A DATA row contains actual values matching the schema fields (e.g. port names, reference numbers, dates, quantities)
+    - A HEADER row contains column labels like "Port", "Exporter", "Month", etc.
+    - A TOTAL row contains aggregated values with words like "Total", "Subtotal", "Grand Total"
+    - An EMPTY row is blank or contains only formatting characters
+    - When in doubt, mark as DATA. The line may have many empty cells but still be a valid data row.
+
+    PARSING RULES:
+    1. Split the line on pipe characters (|) to extract raw cell values
+    2. The raw table may have MORE columns than the schema expects — map the raw cells to schema fields by meaning, not just position
+    3. Skip empty/separator columns that don't match any schema field
+    4. If a cell contains multiple values, split them based on field types
+    5. Ensure output rowData has exactly {{ expectedColumns }} values
+    6. Use null for any schema field that has no matching cell value
+
+    {{ ctx.output_format }}
 
     {{ _.role("user") }}
-    Combine the parsed rows into the final JSON array.
+    Table line: {{ markdownLine }}
+  "#
+}
+
+// Aggregation function to combine parsed rows
+function CombineParsedRows(
+  parsedRows: ParsedTableRow[],
+  userSchema: UserSchema
+) -> string {
+  client CustomGPT4oMini
+  prompt #"
+    Combine these individually parsed table rows into a final JSON array.
+
+    Parsed rows: {{ parsedRows|format(type="toon", delimiter="pipe") }}
+    Target schema: {{ userSchema|format(type="toon", delimiter="pipe") }}
+
+    COMBINATION RULES:
+    1. Skip header rows, total rows, and empty rows
+    2. Only include rows marked as data rows with high confidence
+    3. Map row data to schema fields by position and type
+    4. Convert data types as needed (strings to numbers, dates, etc.)
+    5. Handle hierarchical data by carrying forward group values
+
+    Output: JSON array of objects matching the schema
+
+    {{ _.role("user") }}
+    Process all parsed rows into final structured data.
   "#
 }

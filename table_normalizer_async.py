@@ -144,7 +144,7 @@ def get_available_clients() -> List[str]:
 class NormalizationResult:
     """Result of table normalization process"""
     page_number: int
-    metadata: TableMetadata
+    metadata: Optional[TableMetadata]
     schema: UserSchema
     normalized_data: List[Dict[str, Any]]
     raw_json: str
@@ -406,9 +406,8 @@ def save_parallel_results(
     }
 
     for result in results:
-        output["pages"].append({
-            "page_number": result.page_number,
-            "metadata": {
+        if result.metadata is not None:
+            metadata_dict = {
                 "pageNumber": result.metadata.pageNumber,
                 "tableType": result.metadata.tableType,
                 "dataOrientation": result.metadata.dataOrientation,
@@ -420,7 +419,13 @@ def save_parallel_results(
                 "estimatedRows": result.metadata.estimatedRows,
                 "irregularStructure": result.metadata.irregularStructure,
                 "notes": result.metadata.notes
-            },
+            }
+        else:
+            metadata_dict = None
+
+        output["pages"].append({
+            "page_number": result.page_number,
+            "metadata": metadata_dict,
             "schema": {
                 "className": result.schema.className,
                 "fields": [
