@@ -14,17 +14,18 @@ Tools like [Docling](https://github.com/DS4SD/docling), [Marker](https://github.
 - OCR artifacts from unusual font/spacing combinations
 - Multi-page tables with varying column widths
 
-The key insight: **LLMs can reason about table structure** in ways heuristics cannot. By using AI to *heal* OCR artifacts and *extract* to user-defined schemas, we handle edge cases that break traditional parsers.
+The key insight: **LLMs can reason about table structure** in ways heuristics cannot. By using AI to *analyze* table structure and *extract* to user-defined schemas with built-in merged cell recovery, we handle edge cases that break traditional parsers.
 
 ## Architecture
 
-The pipeline has three distinct stages with clear separation of concerns:
+The pipeline has two distinct stages:
 
 ```
-PDF → Images → OCR → Raw Markdown → HEAL → Clean Markdown → EXTRACT → JSON
-       ↓        ↓                    ↓                        ↓
-   (Poppler) (Tesseract)      (Inferred Schema)        (User Schema)
-                              Document-driven           Human intent
+PDF → Images → OCR → Raw Markdown → ANALYZE + EXTRACT → JSON
+       ↓        ↓                         ↓
+   (Poppler) (Tesseract)           (User Schema)
+                                   Human intent +
+                                   Merged cell recovery
 ```
 
 ### Stage 1: OCR (pdf_to_markdown.py)
@@ -32,29 +33,140 @@ Renders PDF pages as images (via Poppler), then runs Tesseract OCR with spatial 
 
 **Source quality matters:** Vector-based PDFs (Excel/Word exports, digital reports) render as crisp images and produce excellent OCR results. Scanned documents are already rasterized and may contain noise, skew, or compression artifacts - consider preprocessing for best results.
 
-### Stage 2: Heal (table_healer.py)
-Fixes OCR artifacts using an **inferred schema** - what the document *actually shows*:
-1. **InferTableSchema** - Detect column count, merged cells, data types
-2. **HealToStructuredData** - Split merged cells using type boundaries
-3. **FormatAsCleanMarkdown** - Output clean, normalized markdown
+### Stage 2: Extract (table_normalizer_async.py)
+Converts raw markdown to structured JSON using a **user schema** with built-in OCR healing:
+1. **Analyze** (fast model) - Detect table structure (hierarchical, pivot, flat)
+2. **Generate** (reliable model) - Extract records matching your schema, resolving merged cells inline
 
-This stage is *document-driven*. It doesn't know what you want - it fixes what OCR broke.
+Merged cell recovery is integrated directly into the generation prompt using reasoning triggers. The LLM compares each row's values against expected columns, splits cells containing multiple types (e.g. a code next to a date), and assigns each value to the matching schema field.
 
-### Stage 3: Extract (table_normalizer_async.py)
-Converts clean markdown to structured JSON using a **user schema** - what you *actually want*:
-1. **Analyze** - Detect table structure (hierarchical, pivot, flat)
-2. **Generate** - Extract records matching your schema
-3. **Review** - Validate completeness, fill gaps
+## Core BAML Architecture
 
-This stage is *intent-driven*. Your schema defines the output structure.
+The `TableProcessor` class uses a multi-layered concurrency strategy with semaphore-based rate limiting, designed to run efficiently on AWS Lambda.
 
-### Why Separate Healing from Extraction?
+### Semaphore-Based Rate Limiting
 
-**Healing** uses an inferred schema because OCR artifacts are document-specific. A merged cell like "57690 ARRC." needs to be split into `57690` | `ARRC.` regardless of what the user wants to extract.
+```python
+class TableProcessor:
+    def __init__(self, analyze_client, generate_client, max_concurrent_tables=10):
+        self.semaphore = asyncio.Semaphore(max_concurrent_tables)
+```
 
-**Extraction** uses a user schema because the output should match human intent, not OCR quirks. The schema is defined *before* seeing the document.
+- **Prevents API overload**: Without semaphores, processing 100 pages launches 100 concurrent API calls and hits rate limits
+- **Optimal throughput**: Keeps exactly N operations running at once (no idle time, no overload)
+- **Automatic release**: Semaphore released on completion or error
 
-This separation keeps each stage focused and prevents OCR artifacts from polluting the user's schema definition.
+| Scenario | API Calls | Result |
+|----------|-----------|--------|
+| Without semaphores | 100 concurrent | Rate limit errors |
+| With semaphore (10) | 10 concurrent, queued | Smooth processing |
+
+### Async File Loading
+
+```python
+async def load_markdown_file(self, file_path: Path) -> str:
+    if HAS_AIOFILES:
+        async with aiofiles.open(file_path, 'r', encoding='utf-8') as f:
+            return await f.read()
+    else:
+        return await asyncio.to_thread(lambda: file_path.read_text(encoding='utf-8'))
+```
+
+- **Non-blocking**: While one file loads, other operations continue
+- **Graceful fallback**: Uses `aiofiles` if available, falls back to `asyncio.to_thread`
+- **Memory efficient**: Files load on-demand, not all at once
+
+### Sync Client + asyncio.to_thread Pattern
+
+```python
+async def process_single_table(self, markdown_table, page_number, page_context, user_schema):
+    async with self.semaphore:
+        # Step 1: Analyze structure (fast model)
+        metadata = await asyncio.to_thread(
+            lambda: b.with_options(client=self.analyze_client)
+                     .AnalyzeTableStructure(markdown_table, page_context)
+        )
+
+        # Step 2: Generate normalized data (reliable model)
+        normalized_json = await asyncio.to_thread(
+            lambda: b.with_options(client=self.generate_client)
+                     .GenerateNormalizedTable(markdown_table, metadata, user_schema)
+        )
+```
+
+- **`asyncio.to_thread()`**: Runs BAML sync client in thread pool without blocking the event loop
+- **`with_options(client=...)`**: Runtime model selection without redefining BAML functions
+- **Semaphore protection**: Each table acquires the semaphore before making API calls
+- **Error isolation**: One failed table doesn't crash the batch
+
+### Streaming Results (FIRST_COMPLETED)
+
+```python
+async def process_markdown_files(self, file_paths, user_schema):
+    tasks = {asyncio.create_task(process_single_file(fp, i)): i
+             for i, fp in enumerate(file_paths, 1)}
+
+    pending = set(tasks.keys())
+    while pending:
+        done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+        for task in done:
+            result = task.result()
+            results.append(result)
+
+    results.sort(key=lambda r: r.page_number)
+```
+
+- **Results stream as they complete**: No waiting for the slowest page before seeing results
+- **Sorted output**: Final results ordered by page number regardless of completion order
+- **Progress visibility**: Each completed page prints immediately
+
+### TOON Format for Token Optimization
+
+BAML's built-in `format` filter with TOON (Token-Oriented Object Notation) reduces token usage for structured data passed to LLMs:
+
+```baml
+// Metadata as compact TOON instead of verbose JSON
+{{ metadata|format(type="toon", delimiter="pipe") }}
+
+// Field definitions as tabular TOON instead of repeated objects
+{{ userSchema.fields|format(type="toon", delimiter="pipe") }}
+```
+
+TOON represents arrays of objects in tabular format:
+```
+[3]{name,type,description,required}:
+  item_code|string|Product SKU|true
+  quantity|int|Units ordered|false
+  total|float|Line total|false
+```
+
+This is significantly more compact than the equivalent JSON representation, reducing token usage for structured schema and metadata parameters.
+
+### Processing Flow
+
+```
+Level 1: Files (all launched concurrently)
+├── Page 1 (loads async) → process_single_table
+├── Page 2 (loads async) → process_single_table
+└── Page 3 (loads async) → process_single_table
+
+Level 2: Per-table pipeline (semaphore-gated)
+├── Analyze (fast model, ~2s)
+└── Generate + Heal (reliable model, ~15s)
+
+Level 3: Results (streamed as completed)
+├── Page 2 completes first → printed immediately
+├── Page 1 completes second → printed immediately
+└── Page 3 completes last → printed, results sorted by page
+```
+
+### Performance Impact
+
+| Approach | 3 pages | API calls | Wall time |
+|----------|---------|-----------|-----------|
+| Sequential sync | 3 × (analyze + generate) | 6 serial | ~100s |
+| Parallel async + semaphore | 3 × (analyze + generate) | 6 concurrent | ~20s |
+| + TOON format | Same | Same, fewer tokens | ~18s + lower cost |
 
 ## Quick Start
 
@@ -78,10 +190,9 @@ The Jupyter notebook (`pipeline_demo.ipynb`) provides an interactive walkthrough
 1. **Setup Validation** - Check dependencies and API keys
 2. **PDF Selection** - Browse and preview available PDFs
 3. **OCR Conversion** - PDF → Markdown with spatial extraction
-4. **Healing (Optional)** - Fix merged cells and OCR artifacts
-5. **Schema Definition** - Define your target structure
-6. **Extraction** - Convert to normalized JSON
-7. **Review** - Inspect and export results
+4. **Schema Definition** - Define your target structure
+5. **Extraction** - Analyze + Generate to normalized JSON (with merged cell recovery)
+6. **Review** - Inspect and export results
 
 ## CLI Usage
 
@@ -90,19 +201,14 @@ The Jupyter notebook (`pipeline_demo.ipynb`) provides an interactive walkthrough
 uv run python pdf_to_markdown.py input.pdf output.md --dpi 300
 ```
 
-### Heal OCR Artifacts
-```bash
-uv run python table_healer.py input.md -o healed.md
-```
-
 ### Extract to JSON
 ```bash
-uv run python table_normalizer_async.py healed.md output.json --schema my_schema.json
+uv run python table_normalizer_async.py input.md output.json --schema my_schema.json
 ```
 
-### Full Pipeline (Example)
+### List Available Models
 ```bash
-uv run python example_pipeline_async.py
+uv run python table_normalizer_async.py --list-clients
 ```
 
 ## Defining Your Schema
@@ -142,39 +248,31 @@ The schema is purely about *your intent* - what data you need. Keep descriptions
 
 ```
 Core Pipeline:
-├── pdf_to_markdown.py       # Stage 1: OCR
-├── table_healer.py          # Stage 2: Healing
-├── table_normalizer_async.py # Stage 3: Extraction
-└── example_pipeline_async.py # End-to-end example
+├── pdf_to_markdown.py           # Stage 1: OCR
+├── table_normalizer_async.py    # Stage 2: Extraction (with healing)
+└── pipeline_demo.ipynb          # Interactive demo
 
 BAML Definitions:
 ├── baml_src/
-│   ├── table_healing.baml   # Healing prompts
-│   ├── table_analysis.baml  # Extraction prompts
-│   └── clients.baml         # Model configuration
+│   ├── table_analysis.baml      # Analysis + extraction prompts
+│   └── clients.baml             # Model configuration
 
 Configuration:
-├── example_schema.json      # Sample user schema
-├── pyproject.toml           # Dependencies (uv)
-└── requirements.txt         # Dependencies (pip)
-
-Documentation:
-├── README.md                # This file
-├── BAML_README.md           # BAML details
-├── ASYNC_PROCESSING.md      # Async guide
-└── NOTEBOOK_GUIDE.md        # Jupyter usage
+├── example_schema.json          # Sample user schema
+├── pyproject.toml               # Dependencies (uv)
+└── requirements.txt             # Dependencies (pip)
 ```
 
 ## Technical Details
 
 ### TOON Format
-The healing stage uses Token-Optimized Object Notation internally, reducing LLM token usage by 30-50% for structured data.
+The extraction stage uses BAML's built-in TOON format filter to reduce token usage when passing structured metadata and schema definitions to the LLM.
 
 ### Async Parallel Processing
-Multi-page documents are processed in parallel - analysis starts immediately for all pages, and generation follows as soon as each page's analysis completes.
+Multi-page documents are processed in parallel using `asyncio.to_thread` with semaphore-based rate limiting. Results stream via `asyncio.wait(FIRST_COMPLETED)` as each page completes.
 
 ### Model Selection
-Default configuration uses GPT-4o-mini for fast stages (analysis, formatting) and GPT-4o for accuracy-critical stages (healing, generation). Configure in BAML or via CLI flags.
+Default configuration uses GPT-4o-mini for analysis (fast, cheap) and GPT-4o for generation (accurate). Configure in BAML or via CLI flags.
 
 ## Installation
 
@@ -205,5 +303,5 @@ See LICENSE file.
 ## Credits
 
 - [Tesseract OCR](https://github.com/tesseract-ocr/tesseract) - Text extraction
-- [BAML](https://github.com/BoundaryML/baml) - LLM function definitions
+- [BAML](https://github.com/BoundaryML/baml) - LLM function definitions with TOON optimization
 - [pdf2image](https://github.com/Belval/pdf2image) - PDF rendering
